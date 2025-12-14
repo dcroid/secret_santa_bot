@@ -1,7 +1,7 @@
 import logging
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
@@ -13,12 +13,17 @@ from .matching_logic import DrawError, generate_derangement
 
 RECIPIENT_BTN = "Мой получатель 🥰"
 BUDGET_BTN = "Бюджет подарка 💴🎁"
+DELIVERY_INFO_BTN = "Передать QR/трек 📦"
+CANCEL_BTN = "Отмена"
 
 
 class RegistrationForm(StatesGroup):
     fio = State()
     delivery = State()
     wishes = State()
+
+class DeliveryInfoForm(StatesGroup):
+    payload = State()
 
 
 def is_admin(message: Message, settings: Settings) -> bool:
@@ -29,7 +34,14 @@ def user_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=RECIPIENT_BTN), KeyboardButton(text=BUDGET_BTN)],
+            [KeyboardButton(text=DELIVERY_INFO_BTN)],
         ],
+        resize_keyboard=True,
+    )
+
+def cancel_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=CANCEL_BTN)]],
         resize_keyboard=True,
     )
 
@@ -52,6 +64,36 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             return False
         return True
 
+    async def send_delivery_payload_to_receiver(*, sender_message: Message, receiver_tg_id: int) -> None:
+        prefix = "Информация о доставке от твоего Тайного Санты:"
+        if sender_message.text:
+            await sender_message.bot.send_message(
+                chat_id=receiver_tg_id,
+                text=f"{prefix}\n\n{sender_message.text}",
+                parse_mode=None,
+            )
+            return
+
+        caption = sender_message.caption or ""
+        new_caption = prefix if not caption else f"{prefix}\n\n{caption}"
+        if len(new_caption) > 1024:
+            await sender_message.bot.send_message(chat_id=receiver_tg_id, text=prefix, parse_mode=None)
+            await sender_message.bot.copy_message(
+                chat_id=receiver_tg_id,
+                from_chat_id=sender_message.chat.id,
+                message_id=sender_message.message_id,
+                parse_mode=None,
+            )
+            return
+
+        await sender_message.bot.copy_message(
+            chat_id=receiver_tg_id,
+            from_chat_id=sender_message.chat.id,
+            message_id=sender_message.message_id,
+            caption=new_caption,
+            parse_mode=None,
+        )
+
     @dp.message(Command("start", "register"))
     async def register(message: Message, state: FSMContext) -> None:
         await state.clear()
@@ -63,7 +105,8 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
                 f"Адрес доставки: {existing.delivery_info}\n"
                 f"Пожелания: {existing.gift_wishes or 'не указаны'}\n"
                 f"Бюджет подарка: {settings.budget}\n"
-                "Если нужно обновить данные — напиши админу."
+                "Если нужно обновить данные — напиши админу.",
+                reply_markup=user_keyboard(),
             )
             return
         await message.answer(
@@ -115,7 +158,8 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             f"Адрес доставки: {data['delivery']}\n"
             f"Пожелания: {wishes or 'не указаны'}\n"
             f"Бюджет подарка: {settings.budget}\n"
-            "Жеребьевка пока не проведена. Ожидайте уведомления!"
+            "Жеребьевка пока не проведена. Ожидайте уведомления!",
+            reply_markup=user_keyboard(),
         )
 
     @dp.message(Command("admin_menu"))
@@ -215,6 +259,7 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             lines.append(
                 f"Даритель: {pair.giver.fio} (TG {pair.giver.telegram_id}) -> "
                 f"Получатель: {pair.receiver.fio} (TG {pair.receiver.telegram_id})"
+                f"--------------------"
             )
         await message.answer("\n".join(lines))
 
@@ -258,6 +303,86 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             f"Бюджет подарка: {settings.budget}"
         )
         await message.answer(text, reply_markup=user_keyboard())
+
+    @dp.message(Command("send_delivery_info"))
+    @dp.message(F.text == DELIVERY_INFO_BTN)
+    async def send_delivery_info(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        participant = await db.get_participant_by_telegram_id(message.from_user.id)
+        if not participant:
+            await message.answer("Ты ещё не зарегистрирован. Нажми /start и пройди регистрацию.")
+            return
+        draw = await db.get_receiver_for_giver(message.from_user.id)
+        if not draw:
+            await message.answer("Жеребьёвка пока не проведена или пары не назначены.")
+            return
+
+        await state.update_data(receiver_tg_id=draw.receiver.telegram_id)
+        await state.set_state(DeliveryInfoForm.payload)
+        await message.answer(
+            "Отправь одним сообщением данные для получения/доставки: фото QR/штрих-кода и/или текст "
+            "(номер трека, ссылка и т.д.).\n"
+            "Можно отправить фото с подписью.\n"
+            f"Чтобы выйти — нажми «{CANCEL_BTN}» или отправь /cancel.",
+            reply_markup=cancel_keyboard(),
+        )
+
+    @dp.message(StateFilter(DeliveryInfoForm.payload), Command("cancel"))
+    @dp.message(DeliveryInfoForm.payload, F.text == CANCEL_BTN)
+    async def cancel_delivery_info(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=user_keyboard())
+
+    @dp.message(DeliveryInfoForm.payload, F.photo)
+    @dp.message(DeliveryInfoForm.payload, F.document)
+    async def deliver_payload_media(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        receiver_tg_id = data.get("receiver_tg_id")
+        if not receiver_tg_id:
+            await state.clear()
+            await message.answer("Не удалось определить получателя. Попробуй снова.", reply_markup=user_keyboard())
+            return
+        try:
+            await send_delivery_payload_to_receiver(sender_message=message, receiver_tg_id=receiver_tg_id)
+        except Exception:
+            logging.exception("Не удалось отправить доставочную информацию получателю %s", receiver_tg_id)
+            await message.answer(
+                "Не удалось доставить сообщение получателю (возможно, он не запускал бота или запретил сообщения).",
+                reply_markup=user_keyboard(),
+            )
+            await state.clear()
+            return
+        await state.clear()
+        await message.answer("Отправлено получателю.", reply_markup=user_keyboard())
+
+    @dp.message(DeliveryInfoForm.payload, F.text)
+    async def deliver_payload_text(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        receiver_tg_id = data.get("receiver_tg_id")
+        if not receiver_tg_id:
+            await state.clear()
+            await message.answer("Не удалось определить получателя. Попробуй снова.", reply_markup=user_keyboard())
+            return
+        try:
+            await send_delivery_payload_to_receiver(sender_message=message, receiver_tg_id=receiver_tg_id)
+        except Exception:
+            logging.exception("Не удалось отправить доставочную информацию получателю %s", receiver_tg_id)
+            await message.answer(
+                "Не удалось доставить сообщение получателю (возможно, он не запускал бота или запретил сообщения).",
+                reply_markup=user_keyboard(),
+            )
+            await state.clear()
+            return
+        await state.clear()
+        await message.answer("Отправлено получателю.", reply_markup=user_keyboard())
+
+    @dp.message(DeliveryInfoForm.payload)
+    async def deliver_payload_unknown(message: Message) -> None:
+        await message.answer(
+            "Пришли, пожалуйста, либо текст, либо фото (QR/штрих-код) одним сообщением. "
+            f"Чтобы выйти — «{CANCEL_BTN}».",
+            reply_markup=cancel_keyboard(),
+        )
 
     @dp.message(F.text)
     async def fallback(message: Message) -> None:
