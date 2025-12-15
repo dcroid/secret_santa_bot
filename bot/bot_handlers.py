@@ -49,15 +49,21 @@ def cancel_keyboard() -> ReplyKeyboardMarkup:
 def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="/admin_menu"), KeyboardButton(text="/list_participants")],
+            [KeyboardButton(text=RECIPIENT_BTN), KeyboardButton(text=BUDGET_BTN)],
+            [KeyboardButton(text=DELIVERY_INFO_BTN)],
+            [KeyboardButton(text="/list_participants"), KeyboardButton(text="/view_pairs")],
             [KeyboardButton(text="/start_draw"), KeyboardButton(text="/restart_draw")],
-            [KeyboardButton(text="/view_pairs"), KeyboardButton(text="/delete_participant")],
+            [KeyboardButton(text="/delivery_logs"), KeyboardButton(text="/delivery_logs_user")],
+            [KeyboardButton(text="/delete_participant"), KeyboardButton(text="/admin_menu")],
         ],
         resize_keyboard=True,
     )
 
 
 def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
+    def menu_keyboard(message: Message) -> ReplyKeyboardMarkup:
+        return admin_keyboard() if is_admin(message, settings) else user_keyboard()
+
     async def ensure_admin(message: Message) -> bool:
         if not is_admin(message, settings):
             await message.answer("Команда доступна только администратору.")
@@ -106,12 +112,12 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
                 f"Пожелания: {existing.gift_wishes or 'не указаны'}\n"
                 f"Бюджет подарка: {settings.budget}\n"
                 "Если нужно обновить данные — напиши админу.",
-                reply_markup=user_keyboard(),
+                reply_markup=menu_keyboard(message),
             )
             return
         await message.answer(
             "Привет! Давай зарегистрируем тебя для Тайного Санты. Введи, пожалуйста, своё ФИО.",
-            reply_markup=user_keyboard(),
+            reply_markup=menu_keyboard(message),
         )
         await state.set_state(RegistrationForm.fio)
 
@@ -119,7 +125,7 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
     async def start_menu(message: Message) -> None:
         await message.answer(
             "Главное меню. Используй кнопки ниже.",
-            reply_markup=user_keyboard(),
+            reply_markup=menu_keyboard(message),
             )
 
     @dp.message(RegistrationForm.fio)
@@ -159,7 +165,7 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             f"Пожелания: {wishes or 'не указаны'}\n"
             f"Бюджет подарка: {settings.budget}\n"
             "Жеребьевка пока не проведена. Ожидайте уведомления!",
-            reply_markup=user_keyboard(),
+            reply_markup=menu_keyboard(message),
         )
 
     @dp.message(Command("admin_menu"))
@@ -171,9 +177,83 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             "/list_participants — список участников\n"
             "/start_draw — запустить жеребьевку\n"
             "/restart_draw — перезапуск жеребьевки\n"
-            "/view_pairs — показать текущие пары",
+            "/view_pairs — показать текущие пары\n"
+            "/delivery_logs — кто что кому отправлял\n"
+            "/delivery_logs_user <telegram_id> — логи по участнику",
             reply_markup=admin_keyboard(),
         )
+
+    def _format_delivery_log_row(row) -> str:
+        created = row.created_at.strftime("%Y-%m-%d %H:%M")
+        sender = f"{row.giver.fio} (TG {row.giver.telegram_id})"
+        receiver = f"{row.receiver.fio} (TG {row.receiver.telegram_id})"
+        payload = []
+        payload.append(row.kind)
+        if row.status != "sent":
+            payload.append(f"status={row.status}")
+        if row.telegram_message_id:
+            payload.append(f"msg_id={row.telegram_message_id}")
+        if row.telegram_file_id:
+            payload.append(f"file_id={row.telegram_file_id}")
+        if row.text:
+            txt = row.text.replace("\n", " ").strip()
+            payload.append(f"text={txt[:120] + ('…' if len(txt) > 120 else '')}")
+        if row.caption:
+            cap = row.caption.replace("\n", " ").strip()
+            payload.append(f"caption={cap[:120] + ('…' if len(cap) > 120 else '')}")
+        if row.error and row.status != "sent":
+            err = row.error.replace("\n", " ").strip()
+            payload.append(f"error={err[:160] + ('…' if len(err) > 160 else '')}")
+        return f"{created} | {sender} -> {receiver} | " + ", ".join(payload)
+
+    @dp.message(Command("delivery_logs"))
+    async def delivery_logs(message: Message) -> None:
+        if not await ensure_admin(message):
+            return
+        rows = await db.get_delivery_messages(limit=50)
+        if not rows:
+            await message.answer("Логов отправок пока нет.")
+            return
+        lines = [_format_delivery_log_row(r) for r in rows]
+        text = "Последние отправки (до 50):\n" + "\n".join(lines)
+        if len(text) <= 3900:
+            await message.answer(text)
+            return
+        chunk = "Последние отправки (до 50):\n"
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 3900:
+                await message.answer(chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk.strip():
+            await message.answer(chunk)
+
+    @dp.message(Command("delivery_logs_user"))
+    async def delivery_logs_user(message: Message) -> None:
+        if not await ensure_admin(message):
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].strip().isdigit():
+            await message.answer("Использование: /delivery_logs_user <telegram_id>")
+            return
+        tg_id = int(parts[1].strip())
+        rows = await db.get_delivery_messages_for_user(telegram_id=tg_id, limit=50)
+        if not rows:
+            await message.answer("Логов по этому участнику не найдено.")
+            return
+        lines = [_format_delivery_log_row(r) for r in rows]
+        text = f"Последние отправки по TG {tg_id} (до 50):\n" + "\n".join(lines)
+        if len(text) <= 3900:
+            await message.answer(text)
+            return
+        chunk = f"Последние отправки по TG {tg_id} (до 50):\n"
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 3900:
+                await message.answer(chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk.strip():
+            await message.answer(chunk)
 
     @dp.message(Command("list_participants"))
     async def list_participants(message: Message) -> None:
@@ -302,7 +382,7 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             f"Пожелания: {receiver.gift_wishes or 'не указаны'}\n"
             f"Бюджет подарка: {settings.budget}"
         )
-        await message.answer(text, reply_markup=user_keyboard())
+        await message.answer(text, reply_markup=menu_keyboard(message))
 
     @dp.message(Command("send_delivery_info"))
     @dp.message(F.text == DELIVERY_INFO_BTN)
@@ -331,7 +411,7 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
     @dp.message(DeliveryInfoForm.payload, F.text == CANCEL_BTN)
     async def cancel_delivery_info(message: Message, state: FSMContext) -> None:
         await state.clear()
-        await message.answer("Отменено.", reply_markup=user_keyboard())
+        await message.answer("Отменено.", reply_markup=menu_keyboard(message))
 
     @dp.message(DeliveryInfoForm.payload, F.photo)
     @dp.message(DeliveryInfoForm.payload, F.document)
@@ -340,20 +420,54 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
         receiver_tg_id = data.get("receiver_tg_id")
         if not receiver_tg_id:
             await state.clear()
-            await message.answer("Не удалось определить получателя. Попробуй снова.", reply_markup=user_keyboard())
+            await message.answer("Не удалось определить получателя. Попробуй снова.", reply_markup=menu_keyboard(message))
             return
         try:
             await send_delivery_payload_to_receiver(sender_message=message, receiver_tg_id=receiver_tg_id)
-        except Exception:
+            if message.photo:
+                telegram_file_id = message.photo[-1].file_id
+                kind = "photo"
+            else:
+                telegram_file_id = message.document.file_id if message.document else None
+                kind = "document" if message.document else "unknown"
+            await db.log_delivery_message(
+                giver_telegram_id=message.from_user.id,
+                receiver_telegram_id=receiver_tg_id,
+                kind=kind,
+                status="sent",
+                caption=message.caption,
+                telegram_file_id=telegram_file_id,
+                telegram_message_id=message.message_id,
+            )
+        except Exception as exc:
             logging.exception("Не удалось отправить доставочную информацию получателю %s", receiver_tg_id)
+            try:
+                if message.photo:
+                    telegram_file_id = message.photo[-1].file_id
+                    kind = "photo"
+                else:
+                    telegram_file_id = message.document.file_id if message.document else None
+                    kind = "document" if message.document else "unknown"
+                await db.log_delivery_message(
+                    giver_telegram_id=message.from_user.id,
+                    receiver_telegram_id=receiver_tg_id,
+                    kind=kind,
+                    status="failed",
+                    caption=message.caption,
+                    telegram_file_id=telegram_file_id,
+                    telegram_message_id=message.message_id,
+                    error=str(exc),
+                )
+            except Exception:
+                logging.exception("Не удалось записать лог отправки в БД (media)")
             await message.answer(
                 "Не удалось доставить сообщение получателю (возможно, он не запускал бота или запретил сообщения).",
-                reply_markup=user_keyboard(),
+                reply_markup=menu_keyboard(message),
             )
             await state.clear()
             return
         await state.clear()
-        await message.answer("Отправлено получателю.", reply_markup=user_keyboard())
+        await message.answer("Отправлено получателю.", reply_markup=menu_keyboard(message))
 
     @dp.message(DeliveryInfoForm.payload, F.text)
     async def deliver_payload_text(message: Message, state: FSMContext) -> None:
@@ -361,20 +475,40 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
         receiver_tg_id = data.get("receiver_tg_id")
         if not receiver_tg_id:
             await state.clear()
-            await message.answer("Не удалось определить получателя. Попробуй снова.", reply_markup=user_keyboard())
+            await message.answer("Не удалось определить получателя. Попробуй снова.", reply_markup=menu_keyboard(message))
             return
         try:
             await send_delivery_payload_to_receiver(sender_message=message, receiver_tg_id=receiver_tg_id)
-        except Exception:
+            await db.log_delivery_message(
+                giver_telegram_id=message.from_user.id,
+                receiver_telegram_id=receiver_tg_id,
+                kind="text",
+                status="sent",
+                text=message.text,
+                telegram_message_id=message.message_id,
+            )
+        except Exception as exc:
             logging.exception("Не удалось отправить доставочную информацию получателю %s", receiver_tg_id)
+            try:
+                await db.log_delivery_message(
+                    giver_telegram_id=message.from_user.id,
+                    receiver_telegram_id=receiver_tg_id,
+                    kind="text",
+                    status="failed",
+                    text=message.text,
+                    telegram_message_id=message.message_id,
+                    error=str(exc),
+                )
+            except Exception:
+                logging.exception("Не удалось записать лог отправки в БД (text)")
             await message.answer(
                 "Не удалось доставить сообщение получателю (возможно, он не запускал бота или запретил сообщения).",
-                reply_markup=user_keyboard(),
+                reply_markup=menu_keyboard(message),
             )
             await state.clear()
             return
         await state.clear()
-        await message.answer("Отправлено получателю.", reply_markup=user_keyboard())
+        await message.answer("Отправлено получателю.", reply_markup=menu_keyboard(message))
 
     @dp.message(DeliveryInfoForm.payload)
     async def deliver_payload_unknown(message: Message) -> None:
@@ -388,5 +522,5 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
     async def fallback(message: Message) -> None:
         await message.answer(
             "Неизвестная команда. Используйте /start для регистрации.",
-            reply_markup=user_keyboard(),
+            reply_markup=menu_keyboard(message),
         )

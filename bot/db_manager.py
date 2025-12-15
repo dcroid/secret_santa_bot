@@ -61,6 +61,27 @@ class DrawResult(Base):
         "Participant", foreign_keys=[receiver_id], back_populates="receives_from"
     )
 
+class DeliveryMessage(Base):
+    __tablename__ = "delivery_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    giver_id: Mapped[int] = mapped_column(ForeignKey("participants.id"), nullable=False)
+    receiver_id: Mapped[int] = mapped_column(ForeignKey("participants.id"), nullable=False)
+
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # text|photo|document|unknown
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="sent")  # sent|failed
+
+    text: Mapped[Optional[str]] = mapped_column(Text)
+    caption: Mapped[Optional[str]] = mapped_column(Text)
+    telegram_file_id: Mapped[Optional[str]] = mapped_column(String(512))
+    telegram_message_id: Mapped[Optional[int]] = mapped_column(Integer)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    giver: Mapped[Participant] = relationship("Participant", foreign_keys=[giver_id])
+    receiver: Mapped[Participant] = relationship("Participant", foreign_keys=[receiver_id])
+
 
 class Database:
     def __init__(self, *, user: str, password: str, host: str, db_name: str) -> None:
@@ -168,6 +189,67 @@ class Database:
                 .join(Participant, Participant.id == DrawResult.giver_id)
                 .where(Participant.telegram_id == telegram_id)
             )
+
+    async def log_delivery_message(
+        self,
+        *,
+        giver_telegram_id: int,
+        receiver_telegram_id: int,
+        kind: str,
+        status: str,
+        text: Optional[str] = None,
+        caption: Optional[str] = None,
+        telegram_file_id: Optional[str] = None,
+        telegram_message_id: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> DeliveryMessage:
+        async with self.session() as session:
+            giver = await session.scalar(select(Participant).where(Participant.telegram_id == giver_telegram_id))
+            receiver = await session.scalar(
+                select(Participant).where(Participant.telegram_id == receiver_telegram_id)
+            )
+            if not giver or not receiver:
+                raise ValueError("giver or receiver not found")
+
+            row = DeliveryMessage(
+                giver_id=giver.id,
+                receiver_id=receiver.id,
+                kind=kind,
+                status=status,
+                text=text,
+                caption=caption,
+                telegram_file_id=telegram_file_id,
+                telegram_message_id=telegram_message_id,
+                error=error,
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def get_delivery_messages(self, *, limit: int = 50) -> List[DeliveryMessage]:
+        async with self.session() as session:
+            result = await session.scalars(
+                select(DeliveryMessage)
+                .options(selectinload(DeliveryMessage.giver), selectinload(DeliveryMessage.receiver))
+                .order_by(DeliveryMessage.id.desc())
+                .limit(limit)
+            )
+            return list(result)
+
+    async def get_delivery_messages_for_user(self, *, telegram_id: int, limit: int = 50) -> List[DeliveryMessage]:
+        async with self.session() as session:
+            participant = await session.scalar(select(Participant).where(Participant.telegram_id == telegram_id))
+            if not participant:
+                return []
+            result = await session.scalars(
+                select(DeliveryMessage)
+                .options(selectinload(DeliveryMessage.giver), selectinload(DeliveryMessage.receiver))
+                .where((DeliveryMessage.giver_id == participant.id) | (DeliveryMessage.receiver_id == participant.id))
+                .order_by(DeliveryMessage.id.desc())
+                .limit(limit)
+            )
+            return list(result)
 
 
 async def init_database(db: Database) -> None:
