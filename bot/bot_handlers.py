@@ -179,7 +179,7 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             "/restart_draw — перезапуск жеребьевки\n"
             "/view_pairs — показать текущие пары\n"
             "/delivery_logs — кто что кому отправлял\n"
-            "/delivery_logs_user <telegram_id> — логи по участнику",
+            "/delivery_logs_user telegram_id — логи по участнику",
             reply_markup=admin_keyboard(),
         )
 
@@ -217,16 +217,16 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
         lines = [_format_delivery_log_row(r) for r in rows]
         text = "Последние отправки (до 50):\n" + "\n".join(lines)
         if len(text) <= 3900:
-            await message.answer(text)
+            await message.answer(text, parse_mode=None)
             return
         chunk = "Последние отправки (до 50):\n"
         for line in lines:
             if len(chunk) + len(line) + 1 > 3900:
-                await message.answer(chunk)
+                await message.answer(chunk, parse_mode=None)
                 chunk = ""
             chunk += line + "\n"
         if chunk.strip():
-            await message.answer(chunk)
+            await message.answer(chunk, parse_mode=None)
 
     @dp.message(Command("delivery_logs_user"))
     async def delivery_logs_user(message: Message) -> None:
@@ -234,7 +234,7 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             return
         parts = message.text.split(maxsplit=1)
         if len(parts) != 2 or not parts[1].strip().isdigit():
-            await message.answer("Использование: /delivery_logs_user <telegram_id>")
+            await message.answer("Использование: /delivery_logs_user telegram_id", parse_mode=None)
             return
         tg_id = int(parts[1].strip())
         rows = await db.get_delivery_messages_for_user(telegram_id=tg_id, limit=50)
@@ -244,16 +244,16 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
         lines = [_format_delivery_log_row(r) for r in rows]
         text = f"Последние отправки по TG {tg_id} (до 50):\n" + "\n".join(lines)
         if len(text) <= 3900:
-            await message.answer(text)
+            await message.answer(text, parse_mode=None)
             return
         chunk = f"Последние отправки по TG {tg_id} (до 50):\n"
         for line in lines:
             if len(chunk) + len(line) + 1 > 3900:
-                await message.answer(chunk)
+                await message.answer(chunk, parse_mode=None)
                 chunk = ""
             chunk += line + "\n"
         if chunk.strip():
-            await message.answer(chunk)
+            await message.answer(chunk, parse_mode=None)
 
     @dp.message(Command("list_participants"))
     async def list_participants(message: Message) -> None:
@@ -339,7 +339,7 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             lines.append(
                 f"Даритель: {pair.giver.fio} (TG {pair.giver.telegram_id}) -> "
                 f"Получатель: {pair.receiver.fio} (TG {pair.receiver.telegram_id})"
-                f"--------------------"
+                f"\n-------------------\n"
             )
         await message.answer("\n".join(lines))
 
@@ -349,7 +349,7 @@ def setup_handlers(dp: Dispatcher, db: Database, settings: Settings) -> None:
             return
         parts = message.text.split(maxsplit=1)
         if len(parts) != 2 or not parts[1].strip().isdigit():
-            await message.answer("Использование: /delete_participant <telegram_id>")
+            await message.answer("Использование: /delete_participant telegram_id", parse_mode=None)
             return
         tg_id = int(parts[1].strip())
         deleted = await db.delete_participant_by_telegram_id(tg_id)
